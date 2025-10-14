@@ -1,0 +1,20 @@
+# Port to listen on
+port: 8080
+secret_token: "very-secret-token"
+
+# Default Telegram settings
+telegram:
+  enabled: true
+  token: "123456789:ABCDEF123456789abcdef"
+  chat_id: "987654321"
+
+# Per-project overrides
+projects:
+  project-a:
+    telegram:
+      enabled: true
+      chat_id: "111111111" # override chat only
+
+  project-b:
+    telegram:
+      enabled: false # disable telegram for this project

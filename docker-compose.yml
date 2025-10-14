@@ -1,0 +1,15 @@
+services:
+  gitlab-webhook-manager:
+    image: gitlab-webhook-manager:latest
+    container_name: gitlab-webhook-manager
+    restart: always
+    volumes:
+      - ./config:/app/config:ro
+      - ./scripts:/app/scripts:ro
+
+    ports:
+      - "8080:8080"
+    environment:
+      CONFIG_PATH: /app/config/config.yaml
+      SCRIPTS_DIR: /app/scripts
+      SHOW_SECRET: true
