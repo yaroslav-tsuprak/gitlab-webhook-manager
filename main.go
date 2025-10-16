@@ -40,19 +40,52 @@ type Config struct {
 type WebhookPayload struct {
 	ObjectKind       string `json:"object_kind"`
 	ObjectAttributes struct {
-		Status string `json:"status"`
-		Ref    string `json:"ref"`
-		URL    string `json:"url"`
+		ID             int      `json:"id"`
+		Status         string   `json:"status"`
+		Ref            string   `json:"ref"`
+		URL            string   `json:"url"`
+		Source         string   `json:"source"`
+		CreatedAt      string   `json:"created_at"`
+		FinishedAt     string   `json:"finished_at"`
+		Duration       float64  `json:"duration"`
+		QueuedDuration float64  `json:"queued_duration"`
+		Stages         []string `json:"stages"`
 	} `json:"object_attributes"`
+
+	User struct {
+		Name     string `json:"name"`
+		Username string `json:"username"`
+		Email    string `json:"email"`
+	} `json:"user"`
+
 	Project struct {
+		ID                int    `json:"id"`
+		Name              string `json:"name"`
 		Path              string `json:"path"`
 		PathWithNamespace string `json:"path_with_namespace"`
-		Name              string `json:"name"`
 		WebURL            string `json:"web_url"`
+		Namespace         string `json:"namespace"`
 	} `json:"project"`
-	User struct {
-		Name string `json:"name"`
-	} `json:"user"`
+
+	Commit struct {
+		ID      string `json:"id"`
+		Message string `json:"message"`
+		URL     string `json:"url"`
+		Author  struct {
+			Name  string `json:"name"`
+			Email string `json:"email"`
+		} `json:"author"`
+	} `json:"commit"`
+
+	Builds []struct {
+		ID         int     `json:"id"`
+		Stage      string  `json:"stage"`
+		Name       string  `json:"name"`
+		Status     string  `json:"status"`
+		Duration   float64 `json:"duration"`
+		StartedAt  string  `json:"started_at"`
+		FinishedAt string  `json:"finished_at"`
+	} `json:"builds"`
 }
 
 // Глобальные переменные
@@ -83,10 +116,9 @@ func loadConfig(path string) error {
 	cfg = newCfg
 	cfgLock.Unlock()
 
-	// 🧾 Логируем конфигурацию
 	log.Println("--------------------------------------------------")
-	log.Println("[INFO] Конфигурация успешно загружена")
-	log.Printf("[INFO] Порт: %d", cfg.Port)
+	log.Println("[INFO] Config successfully loaded")
+	log.Printf("[INFO] Port: %d", cfg.Port)
 	if cfg.SecretToken != "" {
 		if os.Getenv("SHOW_SECRET") == "true" {
 			log.Printf("[INFO] Secret token: %s", cfg.SecretToken)
@@ -99,9 +131,9 @@ func loadConfig(path string) error {
 	log.Printf("[INFO] Telegram: enabled=%v, chat_id=%s", cfg.Telegram.Enabled, cfg.Telegram.ChatID)
 
 	if len(cfg.Projects) == 0 {
-		log.Println("[INFO] Проектов в конфиге нет")
+		log.Println("[INFO] No per-project configs found")
 	} else {
-		log.Println("[INFO] Настройки по проектам:")
+		log.Println("[INFO] Project overrides:")
 		for name, prj := range cfg.Projects {
 			log.Printf("  - %s: telegram.enabled=%v, chat_id=%s",
 				name, prj.Telegram.Enabled, prj.Telegram.ChatID)
@@ -137,7 +169,7 @@ func main() {
 	}
 
 	if err := loadConfig(configFile); err != nil {
-		log.Fatalf("[FATAL] Не удалось загрузить конфиг: %v", err)
+		log.Fatalf("[FATAL] Failed to load config: %v", err)
 	}
 
 	cfgLock.RLock()
@@ -160,7 +192,7 @@ func main() {
 	// === Основной webhook обработчик ===
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if !checkRequestToken(r) {
-			log.Printf("[WARN] Отказано в доступе: неверный X-Gitlab-Token от %s", r.RemoteAddr)
+			log.Printf("[WARN] Unauthorized X-Gitlab-Token from %s", r.RemoteAddr)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -176,49 +208,67 @@ func main() {
 			return
 		}
 
-		// Обрабатываем только pipeline-события
 		if payload.ObjectKind != "pipeline" {
-			log.Printf("[INFO] Игнорируется webhook с типом '%s'", payload.ObjectKind)
+			log.Printf("[INFO] Ignored webhook type '%s'", payload.ObjectKind)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 
-		// Извлекаем проект
-		project := payload.Project.Path
-		if project == "" {
-			project = payload.Project.PathWithNamespace
-		}
+		project := filepath.Base(payload.Project.PathWithNamespace)
 		if project == "" {
 			project = payload.Project.Name
 		}
-		project = filepath.Base(project)
+		if project == "" {
+			log.Printf("[INFO] Ignored webhook: empty project name")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 
 		status := payload.ObjectAttributes.Status
 		ref := payload.ObjectAttributes.Ref
 		url := payload.ObjectAttributes.URL
 		user := payload.User.Name
+		pipelineID := payload.ObjectAttributes.ID
 
-		if project == "" || status != "success" {
-			log.Printf("[INFO] Игнорируется webhook (project=%s, status=%s)", project, status)
+		commitID := payload.Commit.ID
+		commitMsg := payload.Commit.Message
+		commitURL := payload.Commit.URL
+		author := payload.Commit.Author.Name
+
+		if status != "success" {
+			log.Printf("[INFO] Ignored webhook (project=%s, status=%s)", project, status)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 
-		log.Printf("[INFO] Получен успешный pipeline: project=%s, branch=%s, user=%s, url=%s", project, ref, user, url)
+		projectID := payload.Project.ID
+		log.Printf("[INFO] Successful pipeline: project=%s (id=%d), pipeline_id=%d, branch=%s, user=%s",
+			project, projectID, pipelineID, ref, user)
 
-		// Формируем путь до скрипта
-		script := filepath.Join(scriptsDir, fmt.Sprintf("%s.sh", project))
+		// Формируем путь до скрипта: <project.name>-<project.id>.sh
+		script := filepath.Join(scriptsDir, fmt.Sprintf("%s-%d.sh", project, projectID))
 		if _, err := os.Stat(script); os.IsNotExist(err) {
-			msg := fmt.Sprintf("Нет скрипта для проекта '%s'", project)
+			msg := fmt.Sprintf("❌ Script not found for `%s` (expected %s)", project, filepath.Base(script))
 			log.Println(msg)
-			sendTelegram(project, fmt.Sprintf("❌ %s", msg))
+			sendTelegram(project, msg)
 			http.Error(w, msg, http.StatusNotFound)
 			return
 		}
 
-		// Отправляем уведомление о старте
-		startMsg := fmt.Sprintf("🚀 *Запуск деплоя*\nПроект: `%s`\nВетка: `%s`\nАвтор: %s\n[Открыть Pipeline](%s)",
-			project, ref, user, url)
+		// Уведомление о старте деплоя
+		startMsg := fmt.Sprintf(
+			"🚀 *Deploy started*\n"+
+				"Project: `%s`\n"+
+				"Project ID: `%d`\n"+
+				"Pipeline ID: `%d`\n"+
+				"Branch: `%s`\n"+
+				"Commit: [`%.8s`](%s)\n"+
+				"Message: _%s_\n"+
+				"Author: %s\n"+
+				"Triggered by: %s\n"+
+				"[Open Pipeline →](%s)",
+			project, projectID, pipelineID, ref, commitID, commitURL, commitMsg, author, user, url,
+		)
 		sendTelegram(project, startMsg)
 
 		cmd := exec.Command("bash", script)
@@ -226,23 +276,32 @@ func main() {
 		cmd.Stderr = os.Stderr
 
 		if err := cmd.Run(); err != nil {
-			msg := fmt.Sprintf("❌ Ошибка при выполнении скрипта '%s': %v", project, err)
+			msg := fmt.Sprintf("❌ Error while executing `%s`: %v", filepath.Base(script), err)
 			log.Println(msg)
 			sendTelegram(project, msg)
 			http.Error(w, msg, http.StatusInternalServerError)
 			return
 		}
 
-		doneMsg := fmt.Sprintf("✅ *Деплой завершён*\nПроект: `%s`\nВетка: `%s`\n[Pipeline](%s)", project, ref, url)
+		doneMsg := fmt.Sprintf(
+			"✅ *Deploy finished*\n"+
+				"Project: `%s`\n"+
+				"Project ID: `%d`\n"+
+				"Branch: `%s`\n"+
+				"Pipeline: [`%d`](%s)\n"+
+				"Duration: `%.0f sec`\n"+
+				"Commit: [`%.8s`](%s)",
+			project, projectID, ref, pipelineID, url, payload.ObjectAttributes.Duration, commitID, commitURL,
+		)
 		sendTelegram(project, doneMsg)
-		log.Printf("[INFO] Скрипт для %s выполнен успешно", project)
+		log.Printf("[INFO] Script %s executed successfully", filepath.Base(script))
 		w.WriteHeader(http.StatusOK)
 	})
 
 	// === Эндпоинт для перезагрузки конфига ===
 	http.HandleFunc("/reload", func(w http.ResponseWriter, r *http.Request) {
 		if !checkRequestToken(r) {
-			log.Printf("[WARN] Отказано в доступе к /reload: неверный X-Gitlab-Token от %s", r.RemoteAddr)
+			log.Printf("[WARN] Unauthorized access to /reload from %s", r.RemoteAddr)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -253,18 +312,24 @@ func main() {
 		}
 
 		if err := loadConfig(configFile); err != nil {
-			log.Printf("[ERROR] Перезагрузка конфига не удалась: %v", err)
+			log.Printf("[ERROR] Config reload failed: %v", err)
 			http.Error(w, fmt.Sprintf("Reload failed: %v", err), http.StatusInternalServerError)
 			return
 		}
 
-		log.Println("[INFO] Конфиг успешно перезагружен по запросу /reload")
+		log.Println("[INFO] Config successfully reloaded via /reload")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("Config reloaded successfully\n"))
 	})
 
+	// === Healthcheck ===
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+
 	addr := fmt.Sprintf(":%d", port)
-	log.Printf("[INFO] Сервис запущен, слушает %s", addr)
+	log.Printf("[INFO] Service started on %s", addr)
 	if err := http.ListenAndServe(addr, nil); err != nil {
 		log.Fatal(err)
 	}
@@ -294,7 +359,7 @@ func sendTelegram(project, text string) {
 	}
 
 	if tcfg.Token == "" || tcfg.ChatID == "" {
-		log.Printf("[WARN] Telegram config missing for %s", project)
+		log.Printf("[WARN] Missing Telegram config for %s", project)
 		return
 	}
 
@@ -312,4 +377,9 @@ func sendTelegram(project, text string) {
 		return
 	}
 	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		log.Printf("[WARN] Telegram response %d: %s", resp.StatusCode, string(respBody))
+	}
 }
